@@ -56,7 +56,7 @@ def hay_credenciales_gsheets() -> bool:
 def leer_tabla_compartida(conn, hoja: str, default_df: pd.DataFrame) -> pd.DataFrame:
     """Lee una pestaña del Google Sheet compartido. Si no existe o está vacía, usa el default."""
     try:
-        df = conn.read(worksheet=hoja, ttl=0)
+        df = conn.read(worksheet=hoja, ttl=60)
         df = df.dropna(how="all")
         if df.empty:
             return default_df
