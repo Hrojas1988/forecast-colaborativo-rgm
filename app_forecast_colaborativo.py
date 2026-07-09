@@ -147,7 +147,26 @@ with st.sidebar:
     usar_demo = st.checkbox("Usar datos de ejemplo (ficticios)", value=(archivo is None))
 
 if archivo is not None and not usar_demo:
-    hist = pd.read_csv(archivo) if archivo.name.endswith(".csv") else pd.read_excel(archivo)
+   if archivo.name.endswith(".csv"):
+    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
+        try:
+            archivo.seek(0)
+            hist = pd.read_csv(
+                archivo,
+                sep=None,
+                engine="python",
+                encoding=enc
+            )
+            break
+        except UnicodeDecodeError:
+            continue
+else:
+    hist = pd.read_excel(archivo)
+
+hist.columns = hist.columns.str.strip()
+
+for c in hist.select_dtypes(include="object").columns:
+    hist[c] = hist[c].str.strip()
 else:
     hist = datos_demo()
 
