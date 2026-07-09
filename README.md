@@ -23,6 +23,13 @@ Mes en formato `YYYY-MM`. Agrega las columnas macro que quieras (cualquier nombr
 No afectan el modelo de proyección, solo habilitan el desglose de la sección 10. Puedes subir todas, algunas,
 o ninguna — la app solo muestra los gráficos de las dimensiones que sí tengas cargadas.
 
+## Modo colaborativo (guardado compartido entre todo el equipo)
+
+Por defecto cada persona trabaja aislada en su sesión (nada se guarda al refrescar). Si quieres que los
+cambios (escenario macro, % colaborativo, precio) se guarden y todo el equipo vea lo último editado,
+sigue la guía **SETUP_MODO_COLABORATIVO.md** — toma ~15 minutos, usa un Google Sheet gratis como base de
+datos compartida. Sin esa configuración, la app funciona igual, solo sin guardado compartido.
+
 ## Apartados de la app
 0. Logo (sidebar) — sube el logo de la empresa, se muestra junto al título.
 1. Datos históricos (sidebar) — subes tu archivo o usas datos de ejemplo.

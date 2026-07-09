@@ -26,6 +26,12 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
+try:
+    from streamlit_gsheets import GSheetsConnection
+    GSHEETS_DISPONIBLE = True
+except ImportError:
+    GSHEETS_DISPONIBLE = False
+
 st.set_page_config(page_title="Modelo de Proyección de Presupuesto Colaborativo CBM - CAM SUR", layout="wide")
 
 # -------------------------------------------------------------------
@@ -35,6 +41,36 @@ REQUIRED_COLS = ["Cliente", "SKU", "Mes", "Unidades", "Precio"]
 ATRIBUTOS_CLIENTE = ["Canal", "Grupo_Cliente"]  # opcionales, atributos por Cliente
 ATRIBUTOS_SKU = ["Marca", "Categoria"]  # opcionales, atributos por SKU
 ATRIBUTOS_BB = ATRIBUTOS_CLIENTE + ATRIBUTOS_SKU  # todas las dimensiones de building blocks
+
+
+def hay_credenciales_gsheets() -> bool:
+    try:
+        return "connections" in st.secrets and "gsheets" in st.secrets["connections"]
+    except Exception:
+        return False
+
+
+def leer_tabla_compartida(conn, hoja: str, default_df: pd.DataFrame) -> pd.DataFrame:
+    """Lee una pestaña del Google Sheet compartido. Si no existe o está vacía, usa el default."""
+    try:
+        df = conn.read(worksheet=hoja, ttl=0)
+        df = df.dropna(how="all")
+        if df.empty:
+            return default_df
+        # Alinea tipos de columnas numéricas con el default para que el data_editor no truene
+        for col in default_df.columns:
+            if col in df.columns and pd.api.types.is_numeric_dtype(default_df[col]):
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        faltantes_col = [c for c in default_df.columns if c not in df.columns]
+        for c in faltantes_col:
+            df[c] = default_df[c].iloc[0] if len(default_df) else ""
+        return df[default_df.columns]
+    except Exception:
+        return default_df
+
+
+def guardar_tabla_compartida(conn, hoja: str, df: pd.DataFrame):
+    conn.update(worksheet=hoja, data=df)
 
 
 def datos_demo():
@@ -76,6 +112,19 @@ def meses_futuros(ultimo_mes: str, horizonte: int):
 with st.sidebar:
     st.header("0. Marca")
     logo_file = st.file_uploader("Logo CBM (opcional, PNG/JPG)", type=["png", "jpg", "jpeg"], key="logo")
+
+    st.header("👥 Modo colaborativo")
+    if GSHEETS_DISPONIBLE and hay_credenciales_gsheets():
+        modo_colaborativo = st.checkbox(
+            "Guardar y compartir cambios con todo el equipo (Google Sheets)", value=True,
+            help="Al guardar, cualquier persona que abra este link después verá los últimos valores guardados.",
+        )
+        conn_sheets = st.connection("gsheets", type=GSheetsConnection) if modo_colaborativo else None
+    else:
+        modo_colaborativo = False
+        conn_sheets = None
+        st.caption("⚠️ Modo colaborativo no configurado — cada quien trabaja solo en su sesión. "
+                   "Ver README para conectar un Google Sheet compartido.")
 
 col_logo, col_title = st.columns([1, 6])
 with col_logo:
@@ -188,6 +237,8 @@ if macro_cols:
     escenario_default = pd.DataFrame({"Mes": meses_fcst})
     for c in macro_cols:
         escenario_default[c] = referencias[c]
+    if modo_colaborativo:
+        escenario_default = leer_tabla_compartida(conn_sheets, "escenario_macro", escenario_default)
     escenario = st.data_editor(escenario_default, num_rows="fixed", use_container_width=True,
                                 key="escenario_macro")
 else:
@@ -201,6 +252,8 @@ st.subheader("5. % Colaborativo por iniciativa comercial (editable)")
 inic_default = bau_df[["Cliente", "SKU", "Mes"]].copy()
 inic_default["%_Colaborativo"] = 0.0
 inic_default["Iniciativa"] = ""
+if modo_colaborativo:
+    inic_default = leer_tabla_compartida(conn_sheets, "iniciativas_colaborativo", inic_default)
 iniciativas = st.data_editor(inic_default, num_rows="fixed", use_container_width=True,
                               key="iniciativas", column_config={
                                   "%_Colaborativo": st.column_config.NumberColumn(format="%.1f%%", step=0.5)
@@ -215,6 +268,8 @@ col_a, col_b = st.columns([1, 1])
 with col_a:
     st.markdown("**6a. Precio base por SKU (editable)**")
     precio_default = hist.groupby("SKU")["Precio"].last().reset_index().rename(columns={"Precio": "Precio_Base"})
+    if modo_colaborativo:
+        precio_default = leer_tabla_compartida(conn_sheets, "precios_base", precio_default)
     precios_base = st.data_editor(precio_default, num_rows="fixed", use_container_width=True, key="precios_base")
 
 with col_b:
@@ -233,10 +288,29 @@ st.caption("Úsalo solo para casos puntuales: aumento de lista negociado con un 
 ajuste_precio_default = bau_df[["Cliente", "SKU", "Mes"]].copy()
 ajuste_precio_default["Ajuste_Manual_Precio_%"] = 0.0
 ajuste_precio_default["Motivo"] = ""
+if modo_colaborativo:
+    ajuste_precio_default = leer_tabla_compartida(conn_sheets, "ajuste_manual_precio", ajuste_precio_default)
 ajuste_precio = st.data_editor(
     ajuste_precio_default, num_rows="fixed", use_container_width=True, key="ajuste_precio",
     column_config={"Ajuste_Manual_Precio_%": st.column_config.NumberColumn(format="%.1f%%", step=0.5)},
 )
+
+if modo_colaborativo:
+    st.markdown("---")
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        guardar = st.button("💾 Guardar cambios para todo el equipo", type="primary", use_container_width=True)
+    with c2:
+        st.caption("Guarda el escenario macro, el % colaborativo, el precio base y el ajuste manual "
+                   "en el Google Sheet compartido. La próxima persona que abra este link verá estos valores. "
+                   "Si dos personas guardan al mismo tiempo, gana la última en guardar.")
+    if guardar:
+        with st.spinner("Guardando..."):
+            guardar_tabla_compartida(conn_sheets, "escenario_macro", escenario)
+            guardar_tabla_compartida(conn_sheets, "iniciativas_colaborativo", iniciativas)
+            guardar_tabla_compartida(conn_sheets, "precios_base", precios_base)
+            guardar_tabla_compartida(conn_sheets, "ajuste_manual_precio", ajuste_precio)
+        st.success(f"✅ Guardado {datetime.now():%Y-%m-%d %H:%M} — ya visible para todo el equipo.")
 
 # -------------------------------------------------------------------
 # 6. Cálculo del forecast final
