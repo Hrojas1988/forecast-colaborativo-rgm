@@ -28,6 +28,7 @@ from openpyxl.utils import get_column_letter
 
 try:
     from streamlit_gsheets import GSheetsConnection
+    from gspread.exceptions import WorksheetNotFound
     GSHEETS_DISPONIBLE = True
 except ImportError:
     GSHEETS_DISPONIBLE = False
@@ -38,9 +39,11 @@ st.set_page_config(page_title="Modelo de Proyección de Presupuesto Colaborativo
 # 0. Utilidades
 # -------------------------------------------------------------------
 REQUIRED_COLS = ["Cliente", "SKU", "Mes", "Unidades", "Precio"]
-ATRIBUTOS_CLIENTE = ["Canal", "Grupo_Cliente"]  # opcionales, atributos por Cliente
-ATRIBUTOS_SKU = ["Marca", "Categoria"]  # opcionales, atributos por SKU
-ATRIBUTOS_BB = ATRIBUTOS_CLIENTE + ATRIBUTOS_SKU  # todas las dimensiones de building blocks
+ATRIBUTOS_CLIENTE = ["Canal", "Grupo_Cliente", "Pais"]  # opcionales, atributos por Cliente (características, no predictoras)
+ATRIBUTOS_SKU_BB = ["Marca", "Categoria"]  # opcionales, atributos por SKU usados en building blocks
+ATRIBUTOS_SKU_ID = ["SKU_ID"]  # opcional, identificador de SKU separado del nombre/descripción — solo referencia
+ATRIBUTOS_SKU = ATRIBUTOS_SKU_BB + ATRIBUTOS_SKU_ID
+ATRIBUTOS_BB = ATRIBUTOS_CLIENTE + ATRIBUTOS_SKU_BB  # dimensiones que sí se grafican en building blocks
 
 
 def hay_credenciales_gsheets() -> bool:
@@ -70,24 +73,28 @@ def leer_tabla_compartida(conn, hoja: str, default_df: pd.DataFrame) -> pd.DataF
 
 
 def guardar_tabla_compartida(conn, hoja: str, df: pd.DataFrame):
-    conn.update(worksheet=hoja, data=df)
+    """Actualiza la pestaña si ya existe; si no existe todavía en el Sheet, la crea."""
+    try:
+        conn.update(worksheet=hoja, data=df)
+    except WorksheetNotFound:
+        conn.create(worksheet=hoja, data=df)
 
 
 def datos_demo():
     """Genera un histórico ficticio de 24 meses para probar la app sin subir archivo."""
     np.random.seed(7)
     clientes_info = [
-        ("Supermercado Central", "Moderno", "Cadenas Nacionales"),
-        ("Tienda Express", "Tradicional", "Mayoristas"),
+        ("Supermercado Central", "Moderno", "Cadenas Nacionales", "Costa Rica"),
+        ("Tienda Express", "Tradicional", "Mayoristas", "Panamá"),
     ]
     skus_info = [
-        ("SKU-101 Bebida", "Marca Azul", "Bebidas"),
-        ("SKU-205 Snack", "Marca Roja", "Snacks"),
+        ("SKU-101", "Bebida 600ml", "Marca Azul", "Bebidas"),
+        ("SKU-205", "Snack 150g", "Marca Roja", "Snacks"),
     ]
     meses = pd.date_range("2024-07-01", periods=24, freq="MS")
     filas = []
-    for i, (cli, canal, grupo) in enumerate(clientes_info):
-        for j, (sku, marca, categoria) in enumerate(skus_info):
+    for i, (cli, canal, grupo, pais) in enumerate(clientes_info):
+        for j, (sku_id, sku_nombre, marca, categoria) in enumerate(skus_info):
             base, trend = 900 + i * 300, 4 + j * 2
             for k, mes in enumerate(meses):
                 inflacion = 0.006 + 0.002 * np.sin(k / 6) + np.random.normal(0, 0.0008)
@@ -95,10 +102,10 @@ def datos_demo():
                 season = 50 * np.sin(2 * np.pi * mes.month / 12)
                 unidades = max(base + trend * k + season + np.random.normal(0, 15), 50)
                 precio = round(25 + j * 10 + k * 0.15, 2)
-                filas.append([cli, sku, mes.strftime("%Y-%m"), round(unidades), precio,
-                              round(inflacion, 4), round(tc, 4), canal, grupo, marca, categoria])
+                filas.append([cli, sku_nombre, mes.strftime("%Y-%m"), round(unidades), precio,
+                              round(inflacion, 4), round(tc, 4), canal, grupo, pais, marca, categoria, sku_id])
     return pd.DataFrame(filas, columns=REQUIRED_COLS + ["Inflacion_Mensual", "Var_TipoCambio"]
-                         + ATRIBUTOS_CLIENTE + ATRIBUTOS_SKU)
+                         + ATRIBUTOS_CLIENTE + ATRIBUTOS_SKU_BB + ATRIBUTOS_SKU_ID)
 
 
 def meses_futuros(ultimo_mes: str, horizonte: int):
@@ -161,7 +168,7 @@ posibles_macro = [
 faltan_bb = [c for c in ATRIBUTOS_BB if c not in hist.columns]
 if faltan_bb:
     st.sidebar.info(f"Tip: agrega columnas {faltan_bb} a tu histórico para habilitar todos los building "
-                     f"blocks (Canal, Grupo_Cliente, Marca, Categoria). No son necesarias para el modelo de proyección.")
+                     f"blocks (Canal, Grupo_Cliente, Pais, Marca, Categoria). No son necesarias para el modelo de proyección.")
 
 hist["Venta"] = (hist["Unidades"] * hist["Precio"]).round(2)
 
@@ -246,18 +253,25 @@ else:
     st.info("No seleccionaste variables macro — el forecast usará solo tendencia y estacionalidad.")
 
 # -------------------------------------------------------------------
-# 4. % Colaborativo editable por Cliente-SKU-Mes
+# 4. Palancas de Ejecución Propia — editable por Cliente-SKU-Mes
+#    (mismo lenguaje que el puente de crecimiento del presupuesto: Nuevos Productos,
+#    Profundización de Cuentas, Cuentas Nuevas)
 # -------------------------------------------------------------------
-st.subheader("5. % Colaborativo por iniciativa comercial (editable)")
+st.subheader("5. Palancas de Ejecución Propia (editable)")
+st.caption("Equivalente a las palancas 3, 4 y 5 del puente de crecimiento del presupuesto. "
+           "Afectan **volumen** (unidades), no precio.")
+PALANCAS_EJECUCION = ["Nuevos_Productos_%", "Profundizacion_Cuentas_%", "Cuentas_Nuevas_%"]
 inic_default = bau_df[["Cliente", "SKU", "Mes"]].copy()
-inic_default["%_Colaborativo"] = 0.0
+for pal in PALANCAS_EJECUCION:
+    inic_default[pal] = 0.0
 inic_default["Iniciativa"] = ""
 if modo_colaborativo:
     inic_default = leer_tabla_compartida(conn_sheets, "iniciativas_colaborativo", inic_default)
-iniciativas = st.data_editor(inic_default, num_rows="fixed", use_container_width=True,
-                              key="iniciativas", column_config={
-                                  "%_Colaborativo": st.column_config.NumberColumn(format="%.1f%%", step=0.5)
-                              })
+iniciativas = st.data_editor(
+    inic_default, num_rows="fixed", use_container_width=True, key="iniciativas",
+    column_config={pal: st.column_config.NumberColumn(label=pal.replace("_", " "), format="%.1f%%", step=0.5)
+                   for pal in PALANCAS_EJECUCION},
+)
 
 # -------------------------------------------------------------------
 # 5. Precio: híbrido = escalación automática por inflación + ajuste manual opcional
@@ -322,7 +336,7 @@ coef_df_ren = coef_df.rename(columns={c: f"coef_{c}" for c in macro_cols})
 
 final = bau_df.merge(escenario, on="Mes", how="left") if macro_cols else bau_df.copy()
 final = final.merge(coef_df_ren, on=["Cliente", "SKU"], how="left")
-final = final.merge(iniciativas[["Cliente", "SKU", "Mes", "%_Colaborativo"]], on=["Cliente", "SKU", "Mes"], how="left")
+final = final.merge(iniciativas[["Cliente", "SKU", "Mes"] + PALANCAS_EJECUCION], on=["Cliente", "SKU", "Mes"], how="left")
 final = final.merge(precios_base, on="SKU", how="left")
 final = final.merge(ajuste_precio[["Cliente", "SKU", "Mes", "Ajuste_Manual_Precio_%"]], on=["Cliente", "SKU", "Mes"], how="left")
 
@@ -332,15 +346,19 @@ final["n_mes"] = final["Mes"].map(mes_orden)
 final["Precio_Escalado"] = final["Precio_Base"] * (1 + tasa_inflacion_precio / 100.0) ** final["n_mes"]
 final["Precio"] = (final["Precio_Escalado"] * (1 + final["Ajuste_Manual_Precio_%"].fillna(0) / 100.0)).round(2)
 
-# Impacto macro en unidades = Σ coef_i × (valor_escenario_i − valor_referencia_i)
+# Palanca "Mercado Orgánico" = Σ coef_i × (valor_escenario_i − valor_referencia_i)
 # (referencia = promedio de los últimos 6 meses reales, usado para entrenar el BAU)
-final["Impacto_Macro_Unidades"] = 0.0
+final["Mercado_Organico_Unidades"] = 0.0
 for c in macro_cols:
-    final["Impacto_Macro_Unidades"] += (final[c] - referencias[c]) * final[f"coef_{c}"]
+    final["Mercado_Organico_Unidades"] += (final[c] - referencias[c]) * final[f"coef_{c}"]
+
+for pal in PALANCAS_EJECUCION:
+    final[pal] = final[pal].fillna(0)
+final["Ejecucion_Propia_%"] = final[PALANCAS_EJECUCION].sum(axis=1)
 
 final["Unidades_Final"] = np.round(
-    (final["BAU_Unidades"] + final["Impacto_Macro_Unidades"]).clip(lower=0)
-    * (1 + final["%_Colaborativo"].fillna(0) / 100.0)
+    (final["BAU_Unidades"] + final["Mercado_Organico_Unidades"]).clip(lower=0)
+    * (1 + final["Ejecucion_Propia_%"] / 100.0)
 ).astype(int)
 final["Venta_Final"] = (final["Unidades_Final"] * final["Precio"]).round(0)
 
@@ -350,10 +368,16 @@ if sku_attrs is not None:
     final = final.merge(sku_attrs, on="SKU", how="left")
 
 st.subheader("7. Forecast Final")
-cols_mostrar = ["Cliente", "SKU", "Mes", "BAU_Unidades", "%_Colaborativo", "Unidades_Final",
-                "Precio_Base", "Ajuste_Manual_Precio_%", "Precio", "Venta_Final"]
+atributos_sku_id_presentes = [c for c in ATRIBUTOS_SKU_ID if c in hist.columns]
+cols_contexto = [c for c in ["SKU_ID"] + atributos_cliente_presentes + [x for x in ATRIBUTOS_SKU_BB if x in atributos_sku_presentes]
+                 if c in final.columns]
+cols_mostrar = (["Cliente", "SKU"] + cols_contexto +
+                ["Mes", "BAU_Unidades", "Mercado_Organico_Unidades"] + PALANCAS_EJECUCION +
+                ["Unidades_Final", "Precio_Base", "Ajuste_Manual_Precio_%", "Precio", "Venta_Final"])
 st.dataframe(final[cols_mostrar], use_container_width=True)
-st.caption("Precio = Precio_Base escalado por la tasa de inflación mensual (6b) × (1 + Ajuste_Manual_Precio_% del mes).")
+st.caption("Precio = Precio_Base escalado por la tasa de inflación mensual (6b) × (1 + Ajuste_Manual_Precio_% del mes). "
+           "Mercado_Organico_Unidades = palanca 'Mercado Orgánico' del puente de crecimiento (efecto de tus variables macro). "
+           "Pais, Canal, Grupo_Cliente, Marca, Categoria y SKU_ID son características de referencia — no entran al modelo de proyección.")
 
 resumen = final.groupby("Cliente").agg(
     Unidades_BAU=("BAU_Unidades", "sum"),
@@ -416,7 +440,7 @@ st.caption("Línea sólida = Real (histórico). Línea punteada = Proyectado (fo
 st.subheader("10. Building Blocks por Canal, Grupo de Clientes, Marca y Categoría")
 
 if not atributos_presentes:
-    st.warning("Tu histórico no trae ninguna de las columnas 'Canal', 'Grupo_Cliente', 'Marca' o 'Categoria', "
+    st.warning("Tu histórico no trae ninguna de las columnas 'Canal', 'Grupo_Cliente', 'Pais', 'Marca' o 'Categoria', "
                "así que no puedo armar este desglose. Agrégalas a tu archivo y vuelve a cargarlo — Canal y "
                "Grupo_Cliente van una por Cliente, Marca y Categoria van una por SKU. No afectan el modelo de "
                "proyección, solo habilitan esta vista.")
@@ -442,8 +466,10 @@ else:
 
     metrica_bb = st.radio("Métrica", ["Unidades", "Venta"], horizontal=True, key="metrica_bb")
 
-    COLORES_BB = {"Canal": "#1F4E78", "Grupo_Cliente": "#F28E2B", "Marca": "#4C9A2A", "Categoria": "#A02B93"}
-    TITULOS_BB = {"Canal": "Canal", "Grupo_Cliente": "Grupo de Clientes", "Marca": "Marca", "Categoria": "Categoría"}
+    COLORES_BB = {"Canal": "#1F4E78", "Grupo_Cliente": "#F28E2B", "Pais": "#2E7D32",
+                  "Marca": "#4C9A2A", "Categoria": "#A02B93"}
+    TITULOS_BB = {"Canal": "Canal", "Grupo_Cliente": "Grupo de Clientes", "Pais": "País",
+                  "Marca": "Marca", "Categoria": "Categoría"}
 
     dims_a_mostrar = [d for d in ATRIBUTOS_BB if d in atributos_presentes]
     for fila_inicio in range(0, len(dims_a_mostrar), 2):
@@ -460,9 +486,72 @@ else:
                 st.altair_chart(chart_bb, use_container_width=True)
 
 # -------------------------------------------------------------------
-# 7. Exportar a Excel
+# 9. Puente de Crecimiento — mismo lenguaje que la descomposición del presupuesto
+#    (Base -> Precio -> Mercado Orgánico -> Nuevos Productos -> Profundización -> Cuentas Nuevas -> Total)
 # -------------------------------------------------------------------
-def exportar_excel(hist, coef_df, escenario, iniciativas, precios_base, ajuste_precio, tasa_inflacion_precio, final, resumen) -> bytes:
+st.subheader("11. Puente de Crecimiento (Venta, todo el horizonte proyectado)")
+st.caption("Misma estructura que la descomposición del presupuesto: parte de una base sin ajustes y va "
+           "sumando cada palanca en orden, hasta llegar a la Venta Final proyectada.")
+
+venta_base = float((final["BAU_Unidades"] * final["Precio_Base"]).sum())
+unidades_tras_mercado = (final["BAU_Unidades"] + final["Mercado_Organico_Unidades"]).clip(lower=0)
+venta_tras_precio = float((final["BAU_Unidades"] * final["Precio"]).sum())
+venta_tras_mercado = float((unidades_tras_mercado * final["Precio"]).sum())
+
+unidades_cursor = unidades_tras_mercado.copy()
+ventas_por_palanca = {}
+venta_cursor = venta_tras_mercado
+for pal in PALANCAS_EJECUCION:
+    unidades_cursor = unidades_cursor * (1 + final[pal] / 100.0)
+    venta_nueva = float((unidades_cursor * final["Precio"]).sum())
+    ventas_por_palanca[pal] = venta_nueva - venta_cursor
+    venta_cursor = venta_nueva
+venta_final_total = venta_cursor
+
+NOMBRES_PALANCA = {"Nuevos_Productos_%": "Nuevos Productos", "Profundizacion_Cuentas_%": "Profundización Cuentas",
+                    "Cuentas_Nuevas_%": "Cuentas Nuevas"}
+
+pasos = ["Base (BAU)", "Precio", "Mercado Orgánico"] + [NOMBRES_PALANCA[p] for p in PALANCAS_EJECUCION] + ["Total Proyectado"]
+deltas = [venta_base, venta_tras_precio - venta_base, venta_tras_mercado - venta_tras_precio] + \
+         [ventas_por_palanca[p] for p in PALANCAS_EJECUCION] + [None]
+tipos = ["base"] + ["incremento"] * (len(pasos) - 2) + ["total"]
+
+cumulativo, bottoms, tops = 0.0, [], []
+for i, (paso, delta) in enumerate(zip(pasos, deltas)):
+    if tipos[i] == "base":
+        bottoms.append(0.0); tops.append(delta); cumulativo = delta
+    elif tipos[i] == "total":
+        bottoms.append(0.0); tops.append(cumulativo)
+    else:
+        bottoms.append(cumulativo); tops.append(cumulativo + delta); cumulativo += delta
+
+puente_df = pd.DataFrame({"Paso": pasos, "Bottom": bottoms, "Top": tops, "Tipo": tipos})
+puente_df["Valor"] = [venta_base, venta_tras_precio - venta_base, venta_tras_mercado - venta_tras_precio] + \
+                      [ventas_por_palanca[p] for p in PALANCAS_EJECUCION] + [venta_final_total]
+puente_df["Pct_vs_Base"] = puente_df["Valor"] / venta_base * 100 if venta_base else 0
+
+chart_puente = alt.Chart(puente_df).mark_bar().encode(
+    x=alt.X("Paso:N", sort=pasos, title=None),
+    y=alt.Y("Bottom:Q", title="Venta ($)"),
+    y2="Top:Q",
+    color=alt.Color("Tipo:N", scale=alt.Scale(domain=["base", "incremento", "total"],
+                                               range=["#1F4E78", "#F28E2B", "#2E7D32"]), legend=None),
+    tooltip=["Paso", alt.Tooltip("Valor:Q", format=",.0f"), alt.Tooltip("Pct_vs_Base:Q", format=".1f")],
+).properties(height=380)
+st.altair_chart(chart_puente, use_container_width=True)
+
+tabla_puente = puente_df[["Paso", "Valor", "Pct_vs_Base"]].rename(
+    columns={"Valor": "Venta ($)", "Pct_vs_Base": "% vs Base"})
+st.dataframe(tabla_puente.style.format({"Venta ($)": "{:,.0f}", "% vs Base": "{:.1f}%"}), use_container_width=True)
+st.caption("El Total Proyectado de este puente puede diferir en centavos de la Venta Final del Resumen Ejecutivo: "
+           "el puente usa unidades continuas paso a paso, mientras que la tabla de Forecast Final redondea "
+           "unidades a números enteros mes a mes. La diferencia es de redondeo, no de metodología.")
+
+# -------------------------------------------------------------------
+# 10. Exportar a Excel
+# -------------------------------------------------------------------
+def exportar_excel(hist, coef_df, escenario, iniciativas, precios_base, ajuste_precio, tasa_inflacion_precio,
+                    final, resumen, puente_df) -> bytes:
     wb = Workbook()
     hdr_font = Font(bold=True, color="FFFFFF")
     hdr_fill = PatternFill("solid", start_color="1F4E78")
@@ -504,13 +593,16 @@ def exportar_excel(hist, coef_df, escenario, iniciativas, precios_base, ajuste_p
     ws = wb.create_sheet("Resumen_Ejecutivo")
     volcar(ws, resumen.round(3))
 
+    ws = wb.create_sheet("Puente_Crecimiento")
+    volcar(ws, puente_df[["Paso", "Valor", "Pct_vs_Base"]].round(2))
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
 excel_bytes = exportar_excel(hist, coef_df, escenario, iniciativas, precios_base, ajuste_precio,
-                              tasa_inflacion_precio, final, resumen)
+                              tasa_inflacion_precio, final, resumen, puente_df)
 st.download_button(
     "⬇️ Descargar Excel del modelo",
     data=excel_bytes,
