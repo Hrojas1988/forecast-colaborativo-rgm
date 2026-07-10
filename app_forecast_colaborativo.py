@@ -323,7 +323,13 @@ def ajustar_modelos(hist_df: pd.DataFrame, macro_cols: list, meses_fcst: list, c
     MIN_MESES_TENDENCIA = 6  # con menos historia que esto, no se confía en una tendencia — se usa el promedio
 
     for col in macro_cols:
-        referencias[col] = hist_df[col].tail(6).mean()
+        ref = hist_df[col].tail(6).mean()
+        if pd.isna(ref):
+            # Si las últimas 6 filas no tenían dato para esta variable, usa el promedio
+            # de todo el histórico disponible en vez de dejar la referencia en NaN
+            # (un NaN aquí se propaga hasta el forecast final y tronaba la app).
+            ref = hist_df[col].mean()
+        referencias[col] = ref if pd.notna(ref) else 0.0
 
     for cli, sku in combos:
         serie = hist_df[(hist_df.Cliente == cli) & (hist_df.SKU == sku)].sort_values("Mes").reset_index(drop=True)
@@ -509,10 +515,15 @@ for pal in PALANCAS_EJECUCION:
     final[pal] = final[pal].fillna(0)
 final["Ejecucion_Propia_%"] = final[PALANCAS_EJECUCION].sum(axis=1)
 
-final["Unidades_Final"] = np.round(
+unidades_final_calc = (
     (final["BAU_Unidades"] + final["Mercado_Organico_Unidades"]).clip(lower=0)
     * (1 + final["Ejecucion_Propia_%"] / 100.0)
-).astype(int)
+)
+# Red de seguridad: si por algún NaN/inf que se coló (ej. una variable macro sin
+# suficiente histórico) el cálculo no da un número válido, se usa 0 en vez de
+# tronar la app entera al convertir a entero.
+unidades_final_calc = unidades_final_calc.replace([np.inf, -np.inf], np.nan).fillna(0)
+final["Unidades_Final"] = np.round(unidades_final_calc).astype(int)
 final["Venta_Final"] = (final["Unidades_Final"] * final["Precio"]).round(0)
 
 if cliente_attrs is not None:
