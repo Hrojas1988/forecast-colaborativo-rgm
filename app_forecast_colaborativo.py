@@ -146,55 +146,76 @@ with st.sidebar:
     archivo = st.file_uploader("Sube tu histórico (CSV o Excel)", type=["csv", "xlsx"])
     usar_demo = st.checkbox("Usar datos de ejemplo (ficticios)", value=(archivo is None))
 
+def limpiar_numero(serie: pd.Series) -> pd.Series:
+    """Convierte una columna de texto a número, tolerando formatos comunes de Excel/CSV
+    latinoamericano: espacios como separador de miles ('1 152'), coma como decimal ('28,50'),
+    punto como separador de miles con coma decimal ('1.234,56'), o ya numérico de por sí."""
+    if pd.api.types.is_numeric_dtype(serie):
+        return serie
+    s = serie.astype(str).str.strip()
+    s = s.str.replace("\xa0", "", regex=False).str.replace(" ", "", regex=False)  # espacios de miles
+    tiene_coma = s.str.contains(",", regex=False)
+    tiene_punto = s.str.contains(".", regex=False)
+    ambos = tiene_coma & tiene_punto
+    # Si trae los dos separadores, el que aparece último es el decimal (ej. '1.234,56' -> coma es decimal)
+    s_ambos_coma_decimal = s.where(~ambos, s.str.replace(".", "", regex=False))
+    s = s_ambos_coma_decimal.str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+
 def cargar_historico(archivo):
-    """Lee CSV o Excel de forma robusta: detecta separador de columnas (coma/punto y coma/tab),
-    separador decimal (coma/punto) y codificación (utf-8/latin-1) automáticamente, en vez de
-    asumir un solo formato. Los archivos de Excel en español suelen usar ';' + decimales con coma."""
+    """Lee CSV o Excel de forma robusta: detecta separador de columnas (coma/punto y coma/tab) y
+    codificación (utf-8/latin-1) automáticamente, limpia espacios en los nombres de columna (ej.
+    'Cliente; SKU' con espacio tras el ';'), y limpia los valores numéricos de Unidades/Precio y de
+    cualquier variable macro tolerando espacios de miles y coma decimal — formatos típicos de
+    Excel/ERP en español."""
+
+    def limpiar_columnas(df):
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+
     if not archivo.name.endswith(".csv"):
-        return pd.read_excel(archivo)
+        df = limpiar_columnas(pd.read_excel(archivo))
+    else:
+        import csv
+        ultimo_error, df = None, None
+        for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+            try:
+                archivo.seek(0)
+                muestra = archivo.read(8192)
+                if isinstance(muestra, bytes):
+                    muestra = muestra.decode(encoding)
+                delimitador = csv.Sniffer().sniff(muestra, delimiters=",;\t").delimiter
+                archivo.seek(0)
+                df = limpiar_columnas(pd.read_csv(archivo, sep=delimitador, encoding=encoding,
+                                                   skipinitialspace=True, dtype=str))
+                break
+            except Exception as e:
+                ultimo_error = e
+        if df is None:
+            for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+                try:
+                    archivo.seek(0)
+                    df = limpiar_columnas(pd.read_csv(archivo, sep=None, engine="python",
+                                                        encoding=encoding, dtype=str))
+                    break
+                except Exception as e:
+                    ultimo_error = e
+        if df is None:
+            raise ultimo_error
 
-    import csv
-
-    def numericas_ok(df):
-        cols = [c for c in ("Unidades", "Precio") if c in df.columns]
-        return cols and all(pd.api.types.is_numeric_dtype(df[c]) for c in cols)
-
-    def intentar(sep, decimal, encoding):
-        archivo.seek(0)
-        return pd.read_csv(archivo, sep=sep, decimal=decimal, encoding=encoding)
-
-    ultimo_error, mejor_df = None, None
-    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
-        try:
-            archivo.seek(0)
-            muestra = archivo.read(8192)
-            if isinstance(muestra, bytes):
-                muestra = muestra.decode(encoding)
-            delimitador = csv.Sniffer().sniff(muestra, delimiters=",;\t").delimiter
-            decimal_probable = "," if delimitador != "," else "."
-            df = intentar(delimitador, decimal_probable, encoding)
-            if numericas_ok(df):
-                return df
-            mejor_df = mejor_df if mejor_df is not None else df
-            # Unidades/Precio no quedaron numéricas — probamos con el decimal contrario
-            decimal_alterno = "." if decimal_probable == "," else ","
-            df2 = intentar(delimitador, decimal_alterno, encoding)
-            if numericas_ok(df2):
-                return df2
-            mejor_df = df2 if numericas_ok(df2) else mejor_df
-        except Exception as e:
-            ultimo_error = e
-    if mejor_df is not None:
-        return mejor_df  # devolvemos la mejor lectura aunque Unidades/Precio no quedaran numéricas;
-                          # la validación de columnas más abajo lo señalará con un mensaje claro
-    # Último recurso: dejar que el motor python de pandas decida solo
-    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
-        try:
-            archivo.seek(0)
-            return pd.read_csv(archivo, sep=None, engine="python", encoding=encoding)
-        except Exception as e:
-            ultimo_error = e
-    raise ultimo_error
+    # Limpieza numérica: Unidades, Precio, y cualquier otra columna que no sea texto por diseño
+    # (Cliente/SKU/Mes y los atributos de referencia se dejan tal cual, son texto legítimo)
+    columnas_texto = {"Cliente", "SKU", "Mes"} | set(ATRIBUTOS_CLIENTE) | set(ATRIBUTOS_SKU)
+    for col in df.columns:
+        if col in ("Unidades", "Precio"):
+            df[col] = limpiar_numero(df[col])
+        elif col not in columnas_texto:
+            candidata = limpiar_numero(df[col])
+            # Solo adoptamos la versión numérica si casi todo convirtió bien (si no, es texto legítimo)
+            if candidata.notna().mean() >= 0.9:
+                df[col] = candidata
+    return df
 
 
 if archivo is not None and not usar_demo:
@@ -235,6 +256,22 @@ if faltan_bb:
                      f"blocks (Canal, Grupo_Cliente, Pais, Marca, Categoria). No son necesarias para el modelo de proyección.")
 
 hist["Venta"] = (hist["Unidades"] * hist["Precio"]).round(2)
+
+# Si el archivo trae varias filas para el mismo Cliente-SKU-Mes (ej. transacciones sueltas en vez de
+# un total mensual ya agregado), las consolidamos en una sola fila por mes. Si no hay duplicados,
+# esto no cambia nada.
+n_antes = len(hist)
+cols_agg_extra = {c: "mean" for c in posibles_macro}
+cols_agg_extra.update({c: "first" for c in atributos_presentes})
+hist = hist.groupby(["Cliente", "SKU", "Mes"], as_index=False).agg(
+    Unidades=("Unidades", "sum"), Venta=("Venta", "sum"), **{
+        k: pd.NamedAgg(column=k, aggfunc=v) for k, v in cols_agg_extra.items()
+    }
+)
+hist["Precio"] = np.where(hist["Unidades"] != 0, hist["Venta"] / hist["Unidades"], 0.0).round(2)
+if n_antes != len(hist):
+    st.sidebar.info(f"Tu archivo traía {n_antes - len(hist)} filas duplicadas para el mismo Cliente-SKU-Mes "
+                     f"(ej. transacciones sueltas) — las consolidé sumando Unidades y Venta por mes.")
 
 with st.sidebar:
     st.header("2. Variables macro / adicionales")
