@@ -53,26 +53,13 @@ def hay_credenciales_gsheets() -> bool:
         return False
 
 
-def leer_tabla_compartida(conn, hoja: str, default_df: pd.DataFrame, claves: list, nombre_legible: str = None) -> pd.DataFrame:
-    """Lee una pestaña del Google Sheet compartido. Si no existe, está vacía, o sus claves
-    (Cliente/SKU/Mes/etc.) no corresponden al archivo actualmente cargado — por ejemplo, quedó
-    guardada de una corrida anterior con otro archivo — usa el default fresco en su lugar,
-    para no arrastrar NaN por combinaciones que ya no existen."""
+def leer_tabla_compartida(conn, hoja: str, default_df: pd.DataFrame) -> pd.DataFrame:
+    """Lee una pestaña del Google Sheet compartido. Si no existe o está vacía, usa el default."""
     try:
         df = conn.read(worksheet=hoja, ttl=60)
         df = df.dropna(how="all")
-        if df.empty or not all(c in df.columns for c in claves):
+        if df.empty:
             return default_df
-
-        claves_guardadas = set(map(tuple, df[claves].astype(str).values.tolist()))
-        claves_esperadas = set(map(tuple, default_df[claves].astype(str).values.tolist()))
-        cobertura = len(claves_guardadas & claves_esperadas) / len(claves_esperadas) if claves_esperadas else 0
-        if cobertura < 0.5:
-            if nombre_legible:
-                st.sidebar.warning(f"⚠️ Lo guardado antes en '{nombre_legible}' no corresponde a este archivo "
-                                    f"(parece de otra corrida u otro histórico) — usando valores nuevos por defecto.")
-            return default_df
-
         # Alinea tipos de columnas numéricas con el default para que el data_editor no truene
         for col in default_df.columns:
             if col in df.columns and pd.api.types.is_numeric_dtype(default_df[col]):
@@ -80,13 +67,6 @@ def leer_tabla_compartida(conn, hoja: str, default_df: pd.DataFrame, claves: lis
         faltantes_col = [c for c in default_df.columns if c not in df.columns]
         for c in faltantes_col:
             df[c] = default_df[c].iloc[0] if len(default_df) else ""
-
-        # Aunque haya suficiente cobertura, puede haber filas nuevas (SKUs/meses nuevos) sin guardar
-        # todavía — las completamos con el default en vez de dejarlas en NaN.
-        df = default_df[claves].merge(df, on=claves, how="left")
-        for col in default_df.columns:
-            if col not in claves:
-                df[col] = df[col].fillna(default_df[col])
         return df[default_df.columns]
     except Exception:
         return default_df
@@ -320,7 +300,6 @@ sku_attrs = hist[["SKU"] + atributos_sku_presentes].drop_duplicates("SKU") if at
 @st.cache_data(show_spinner=False)
 def ajustar_modelos(hist_df: pd.DataFrame, macro_cols: list, meses_fcst: list, combos: list):
     resultados_bau, coeficientes, referencias = [], [], {}
-    MIN_MESES_TENDENCIA = 6  # con menos historia que esto, no se confía en una tendencia — se usa el promedio
 
     for col in macro_cols:
         referencias[col] = hist_df[col].tail(6).mean()
@@ -328,27 +307,12 @@ def ajustar_modelos(hist_df: pd.DataFrame, macro_cols: list, meses_fcst: list, c
     for cli, sku in combos:
         serie = hist_df[(hist_df.Cliente == cli) & (hist_df.SKU == sku)].sort_values("Mes").reset_index(drop=True)
         n = len(serie)
-        y_hist = serie["Unidades"].values.astype(float)
-        promedio_hist = y_hist.mean() if n else 0.0
-        maximo_hist = y_hist.max() if n else 0.0
-        # Tope de sensatez: ninguna proyección puede superar 2x el máximo histórico de ESE combo,
-        # ni 3x su promedio — evita que una tendencia mal ajustada (por poca historia) se dispare.
-        tope = max(maximo_hist * 2, promedio_hist * 3, 1.0)
-
-        if n < MIN_MESES_TENDENCIA:
-            # Muy poca historia para confiar en tendencia/estacionalidad: se proyecta el promedio plano
-            coefs = {"trend": 0.0, "sin": 0.0, "cos": 0.0, **{c: 0.0 for c in macro_cols}, "intercept": promedio_hist}
-            coeficientes.append({"Cliente": cli, "SKU": sku, **coefs})
-            for mes in meses_fcst:
-                resultados_bau.append({"Cliente": cli, "SKU": sku, "Mes": mes, "BAU_Unidades": round(promedio_hist)})
-            continue
-
         t = np.arange(n)
         sin_t, cos_t = np.sin(2 * np.pi * t / 12), np.cos(2 * np.pi * t / 12)
 
         X_cols = [t, sin_t, cos_t] + [serie[c].values for c in macro_cols]
         X = np.column_stack(X_cols)
-        y = y_hist
+        y = serie["Unidades"].values.astype(float)
 
         modelo = LinearRegression().fit(X, y)
         coefs = dict(zip(["trend", "sin", "cos"] + macro_cols, modelo.coef_))
@@ -359,7 +323,7 @@ def ajustar_modelos(hist_df: pd.DataFrame, macro_cols: list, meses_fcst: list, c
         sin_f, cos_f = np.sin(2 * np.pi * t_f / 12), np.cos(2 * np.pi * t_f / 12)
         X_f_cols = [t_f, sin_f, cos_f] + [np.full(len(meses_fcst), referencias[c]) for c in macro_cols]
         X_f = np.column_stack(X_f_cols)
-        bau = np.clip(modelo.predict(X_f), 0, tope)
+        bau = np.clip(modelo.predict(X_f), 0, None)
 
         for k, mes in enumerate(meses_fcst):
             resultados_bau.append({"Cliente": cli, "SKU": sku, "Mes": mes, "BAU_Unidades": round(bau[k])})
@@ -382,8 +346,7 @@ if macro_cols:
     for c in macro_cols:
         escenario_default[c] = referencias[c]
     if modo_colaborativo:
-        escenario_default = leer_tabla_compartida(conn_sheets, "escenario_macro", escenario_default,
-                                                   claves=["Mes"], nombre_legible="Escenario macro")
+        escenario_default = leer_tabla_compartida(conn_sheets, "escenario_macro", escenario_default)
     escenario = st.data_editor(escenario_default, num_rows="fixed", use_container_width=True,
                                 key="escenario_macro")
 else:
@@ -404,8 +367,7 @@ for pal in PALANCAS_EJECUCION:
     inic_default[pal] = 0.0
 inic_default["Iniciativa"] = ""
 if modo_colaborativo:
-    inic_default = leer_tabla_compartida(conn_sheets, "iniciativas_colaborativo", inic_default,
-                                          claves=["Cliente", "SKU", "Mes"], nombre_legible="Palancas de ejecución")
+    inic_default = leer_tabla_compartida(conn_sheets, "iniciativas_colaborativo", inic_default)
 iniciativas = st.data_editor(
     inic_default, num_rows="fixed", use_container_width=True, key="iniciativas",
     column_config={pal: st.column_config.NumberColumn(label=pal.replace("_", " "), format="%.1f%%", step=0.5)
@@ -422,8 +384,7 @@ with col_a:
     st.markdown("**6a. Precio base por SKU (editable)**")
     precio_default = hist.groupby("SKU")["Precio"].last().reset_index().rename(columns={"Precio": "Precio_Base"})
     if modo_colaborativo:
-        precio_default = leer_tabla_compartida(conn_sheets, "precios_base", precio_default,
-                                                claves=["SKU"], nombre_legible="Precio base")
+        precio_default = leer_tabla_compartida(conn_sheets, "precios_base", precio_default)
     precios_base = st.data_editor(precio_default, num_rows="fixed", use_container_width=True, key="precios_base")
 
 with col_b:
@@ -443,8 +404,7 @@ ajuste_precio_default = bau_df[["Cliente", "SKU", "Mes"]].copy()
 ajuste_precio_default["Ajuste_Manual_Precio_%"] = 0.0
 ajuste_precio_default["Motivo"] = ""
 if modo_colaborativo:
-    ajuste_precio_default = leer_tabla_compartida(conn_sheets, "ajuste_manual_precio", ajuste_precio_default,
-                                                   claves=["Cliente", "SKU", "Mes"], nombre_legible="Ajuste manual de precio")
+    ajuste_precio_default = leer_tabla_compartida(conn_sheets, "ajuste_manual_precio", ajuste_precio_default)
 ajuste_precio = st.data_editor(
     ajuste_precio_default, num_rows="fixed", use_container_width=True, key="ajuste_precio",
     column_config={"Ajuste_Manual_Precio_%": st.column_config.NumberColumn(format="%.1f%%", step=0.5)},
@@ -480,18 +440,6 @@ final = final.merge(coef_df_ren, on=["Cliente", "SKU"], how="left")
 final = final.merge(iniciativas[["Cliente", "SKU", "Mes"] + PALANCAS_EJECUCION], on=["Cliente", "SKU", "Mes"], how="left")
 final = final.merge(precios_base, on="SKU", how="left")
 final = final.merge(ajuste_precio[["Cliente", "SKU", "Mes", "Ajuste_Manual_Precio_%"]], on=["Cliente", "SKU", "Mes"], how="left")
-
-# Red de seguridad: si algún merge no encontró coincidencia (por ejemplo, datos de una corrida
-# anterior con otro archivo que no se limpiaron a tiempo), rellenamos con un valor neutro en vez
-# de dejar NaN — así nunca vuelve a tronar el cálculo final, aunque sí conviene revisar el aviso
-# de la barra lateral si aparece.
-for c in macro_cols:
-    final[c] = final[c].fillna(referencias[c])
-    final[f"coef_{c}"] = final[f"coef_{c}"].fillna(0.0)
-final["BAU_Unidades"] = final["BAU_Unidades"].fillna(0)
-if final["Precio_Base"].isna().any():
-    st.sidebar.warning("⚠️ Algunos SKU no tenían Precio_Base guardado — se usó el precio promedio como respaldo.")
-    final["Precio_Base"] = final["Precio_Base"].fillna(final["Precio_Base"].mean())
 
 # Número de mes transcurrido (1, 2, 3...) para la escalación compuesta
 mes_orden = {m: i + 1 for i, m in enumerate(meses_fcst)}
@@ -554,7 +502,7 @@ fcst_comb = final[fcst_comb_cols].rename(columns={"Unidades_Final": "Unidades", 
 fcst_comb["Tipo"] = "Proyectado"
 
 combinado = pd.concat([hist_comb, fcst_comb], ignore_index=True)
-orden_meses = sorted(hist["Mes"].unique()) + list(meses_fcst)
+orden_meses = list(hist["Mes"].unique()) + list(meses_fcst)
 combinado["Mes"] = pd.Categorical(combinado["Mes"], categories=orden_meses, ordered=True)
 
 # -------------------------------------------------------------------
