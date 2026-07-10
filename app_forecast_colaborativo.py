@@ -146,27 +146,72 @@ with st.sidebar:
     archivo = st.file_uploader("Sube tu histórico (CSV o Excel)", type=["csv", "xlsx"])
     usar_demo = st.checkbox("Usar datos de ejemplo (ficticios)", value=(archivo is None))
 
-if archivo is not None and not usar_demo:
-   if archivo.name.endswith(".csv"):
-    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
+def cargar_historico(archivo):
+    """Lee CSV o Excel de forma robusta: detecta separador de columnas (coma/punto y coma/tab),
+    separador decimal (coma/punto) y codificación (utf-8/latin-1) automáticamente, en vez de
+    asumir un solo formato. Los archivos de Excel en español suelen usar ';' + decimales con coma."""
+    if not archivo.name.endswith(".csv"):
+        return pd.read_excel(archivo)
+
+    import csv
+
+    def numericas_ok(df):
+        cols = [c for c in ("Unidades", "Precio") if c in df.columns]
+        return cols and all(pd.api.types.is_numeric_dtype(df[c]) for c in cols)
+
+    def intentar(sep, decimal, encoding):
+        archivo.seek(0)
+        return pd.read_csv(archivo, sep=sep, decimal=decimal, encoding=encoding)
+
+    ultimo_error, mejor_df = None, None
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             archivo.seek(0)
-            hist = pd.read_csv(
-                archivo,
-                sep=None,
-                engine="python",
-                encoding=enc
-            )
-            break
-        except UnicodeDecodeError:
-            continue
-else:
-    hist = pd.read_excel(archivo)
+            muestra = archivo.read(8192)
+            if isinstance(muestra, bytes):
+                muestra = muestra.decode(encoding)
+            delimitador = csv.Sniffer().sniff(muestra, delimiters=",;\t").delimiter
+            decimal_probable = "," if delimitador != "," else "."
+            df = intentar(delimitador, decimal_probable, encoding)
+            if numericas_ok(df):
+                return df
+            mejor_df = mejor_df if mejor_df is not None else df
+            # Unidades/Precio no quedaron numéricas — probamos con el decimal contrario
+            decimal_alterno = "." if decimal_probable == "," else ","
+            df2 = intentar(delimitador, decimal_alterno, encoding)
+            if numericas_ok(df2):
+                return df2
+            mejor_df = df2 if numericas_ok(df2) else mejor_df
+        except Exception as e:
+            ultimo_error = e
+    if mejor_df is not None:
+        return mejor_df  # devolvemos la mejor lectura aunque Unidades/Precio no quedaran numéricas;
+                          # la validación de columnas más abajo lo señalará con un mensaje claro
+    # Último recurso: dejar que el motor python de pandas decida solo
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            archivo.seek(0)
+            return pd.read_csv(archivo, sep=None, engine="python", encoding=encoding)
+        except Exception as e:
+            ultimo_error = e
+    raise ultimo_error
 
-hist.columns = hist.columns.str.strip()
 
-for c in hist.select_dtypes(include="object").columns:
-    hist[c] = hist[c].str.strip()
+if archivo is not None and not usar_demo:
+    try:
+        hist = cargar_historico(archivo)
+    except Exception as e:
+        st.error(
+            "No pude leer tu archivo. Esto casi siempre pasa por el formato del CSV — por ejemplo, "
+            "si Excel lo guardó separado por punto y coma (`;`) en vez de coma, o con una codificación "
+            "de caracteres distinta a UTF-8.\n\n"
+            "**Prueba esto:**\n"
+            "1. En Excel: 'Guardar como' → elige **'Libro de Excel (.xlsx)'** en vez de CSV, y sube ese archivo. "
+            "Es el formato más confiable.\n"
+            "2. Si necesitas CSV sí o sí: ábrelo en Excel, 'Guardar como' → 'CSV UTF-8 (delimitado por comas)'.\n\n"
+            f"Detalle técnico del error: `{e}`"
+        )
+        st.stop()
 else:
     hist = datos_demo()
 
