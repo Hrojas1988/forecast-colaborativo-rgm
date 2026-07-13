@@ -72,11 +72,36 @@ datos compartida. Sin esa configuración, la app funciona igual, solo sin guarda
 Botón de descarga al final exporta todo a Excel (una hoja por tabla).
 
 ## Qué hace el modelo
-Por cada combinación Cliente-SKU se entrena una Regresión Lineal:
+Por cada combinación Cliente-SKU, primero se clasifica según la calidad de su historia:
+- **Excluido (compra única):** solo 1 mes de historia — no se proyecta (BAU = 0).
+- **Promedio plano (poca historia / esporádico):** menos de 6 meses, o compras con huecos grandes entre
+  mes y mes — se proyecta el promedio histórico, sin tendencia ni estacionalidad.
+- **Tendencia + estacionalidad:** 6+ meses con compras razonablemente regulares — se ajusta una Regresión
+  Lineal **en espacio logarítmico** (el modelo aprende un % de crecimiento mensual, no unidades absolutas):
 
-Unidades = intercepto + coef_trend·t + coef_sin·sin(2πt/12) + coef_cos·cos(2πt/12) + Σ coef_macro_i · variable_macro_i
+  `log(Unidades) = intercepto + coef_trend·mes_calendario + coef_sin·sin(mes_del_año) + coef_cos·cos(mes_del_año) + Σ coef_macro_i · variable_macro_i`
+
+  La tendencia tiene un tope de sensatez: máximo 3%/mes si seleccionaste variables macro, o solo 1%/mes si
+  no seleccionaste ninguna (sin variables que expliquen el crecimiento, el modelo no debe inventarlo). La
+  estacionalidad se calcula sobre el mes calendario real (enero, febrero...), no sobre la posición de la
+  fila, así que los huecos en el histórico no la desalinean.
 
 El BAU se proyecta usando el valor de referencia (promedio de los últimos 6 meses) de cada variable macro.
-El impacto de tu escenario editado se calcula como coef_i × (valor_escenario − valor_referencia), evitando doble conteo.
-El % colaborativo se aplica multiplicativamente sobre las unidades (BAU + impacto macro).
+El impacto de tu escenario editado se calcula como `coef_i × (valor_escenario − valor_referencia)`, ahora en
+**%** (Mercado_Organico_%), evitando doble conteo. El % colaborativo (palancas de ejecución propia) se aplica
+multiplicativamente sobre las unidades (BAU ya ajustado por Mercado Orgánico).
 El precio final = Precio_Base × (1 + tasa_inflación)^n_mes × (1 + Ajuste_Manual_Precio_% del mes).
+
+En el Forecast Final (sección 7) puedes ver la columna `Categoria_Modelo` para saber cómo se proyectó cada
+fila, y un expander con el conteo de Cliente-SKU en cada categoría.
+
+## Descargas
+Al final hay 2 botones: **Excel** (todas las hojas: histórico, coeficientes, escenario, palancas, precios,
+forecast final, resumen, puente de crecimiento) y **CSV** (solo el Forecast Final, separado por `;` y
+decimal `,` para que abra directo en Excel en español).
+
+## Eficiencia del guardado compartido
+Con miles de combinaciones Cliente-SKU-Mes, guardar la grilla completa en Google Sheets sería lentísimo.
+Por eso el botón de guardado solo sube las filas que **sí editaste** (palancas ≠ 0%, o ajuste de precio ≠ 0%)
+— el resto se completa solo con el valor por defecto (0%) al cargar. Esto no cambia nada de cómo usas la
+app, solo la hace mucho más rápida con archivos grandes.

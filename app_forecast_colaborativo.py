@@ -66,8 +66,11 @@ def leer_tabla_compartida(conn, hoja: str, default_df: pd.DataFrame, claves: lis
 
         claves_guardadas = set(map(tuple, df[claves].astype(str).values.tolist()))
         claves_esperadas = set(map(tuple, default_df[claves].astype(str).values.tolist()))
-        cobertura = len(claves_guardadas & claves_esperadas) / len(claves_esperadas) if claves_esperadas else 0
-        if cobertura < 0.5:
+        interseccion = claves_guardadas & claves_esperadas
+        # Ojo: el denominador es lo GUARDADO, no la grilla completa esperada — así los guardados
+        # parciales (solo las filas que alguien editó, no las ~decenas de miles en cero) validan bien.
+        cobertura = len(interseccion) / len(claves_guardadas) if claves_guardadas else 1.0
+        if claves_guardadas and cobertura < 0.5:
             if nombre_legible:
                 st.sidebar.warning(f"⚠️ Lo guardado antes en '{nombre_legible}' no corresponde a este archivo "
                                     f"(parece de otra corrida u otro histórico) — usando valores nuevos por defecto.")
@@ -320,10 +323,29 @@ sku_attrs = hist[["SKU"] + atributos_sku_presentes].drop_duplicates("SKU") if at
 @st.cache_data(show_spinner=False)
 def ajustar_modelos(hist_df: pd.DataFrame, macro_cols: list, meses_fcst: list, combos: list):
     resultados_bau, coeficientes, referencias = [], [], {}
-    MIN_MESES_TENDENCIA = 6  # con menos historia que esto, no se confía en una tendencia — se usa el promedio
+    MIN_MESES_TENDENCIA = 6      # con menos meses que esto, no se confía en tendencia
+    MIN_COBERTURA = 0.6          # si el cliente compra en menos del 60% de su propia ventana, es esporádico
+    CAP_TREND_CON_MACRO = 0.03   # tope de tendencia: 3%/mes si hay variables macro explicando el crecimiento
+    CAP_TREND_SIN_MACRO = 0.01   # 1%/mes si NO hay macro — sin explicación, el BAU debe ser casi plano
 
     for col in macro_cols:
         referencias[col] = hist_df[col].tail(6).mean()
+
+    # Índice calendario global (continuo, sin huecos) para que la tendencia y la estacionalidad
+    # se calculen sobre el mes real, no sobre la posición de la fila (que se rompe con huecos).
+    todos_los_meses = sorted(set(hist_df["Mes"].unique()) | set(meses_fcst))
+    base_y, base_m = (int(x) for x in todos_los_meses[0].split("-"))
+
+    def idx_calendario(mes_str):
+        y, m = (int(x) for x in mes_str.split("-"))
+        return (y - base_y) * 12 + (m - base_m)
+
+    def mes_del_anio(mes_str):
+        return int(mes_str.split("-")[1])
+
+    idx_futuro = np.array([idx_calendario(m) for m in meses_fcst])
+    mes_futuro = np.array([mes_del_anio(m) for m in meses_fcst])
+    sin_f, cos_f = np.sin(2 * np.pi * mes_futuro / 12), np.cos(2 * np.pi * mes_futuro / 12)
 
     for cli, sku in combos:
         serie = hist_df[(hist_df.Cliente == cli) & (hist_df.SKU == sku)].sort_values("Mes").reset_index(drop=True)
@@ -331,38 +353,50 @@ def ajustar_modelos(hist_df: pd.DataFrame, macro_cols: list, meses_fcst: list, c
         y_hist = serie["Unidades"].values.astype(float)
         promedio_hist = y_hist.mean() if n else 0.0
         maximo_hist = y_hist.max() if n else 0.0
-        # Tope de sensatez: ninguna proyección puede superar 2x el máximo histórico de ESE combo,
-        # ni 3x su promedio — evita que una tendencia mal ajustada (por poca historia) se dispare.
-        tope = max(maximo_hist * 2, promedio_hist * 3, 1.0)
+        idx_hist = np.array([idx_calendario(m) for m in serie["Mes"]])
+        cobertura = n / (idx_hist.max() - idx_hist.min() + 1) if n > 1 else 1.0
 
-        if n < MIN_MESES_TENDENCIA:
-            # Muy poca historia para confiar en tendencia/estacionalidad: se proyecta el promedio plano
+        if n <= 1:
+            categoria = "Excluido (compra única)"
+            coefs = {"trend": 0.0, "sin": 0.0, "cos": 0.0, **{c: 0.0 for c in macro_cols}, "intercept": 0.0}
+            bau_futuro = np.zeros(len(meses_fcst))
+        elif n < MIN_MESES_TENDENCIA or cobertura < MIN_COBERTURA:
+            categoria = "Promedio plano (poca historia / esporádico)"
             coefs = {"trend": 0.0, "sin": 0.0, "cos": 0.0, **{c: 0.0 for c in macro_cols}, "intercept": promedio_hist}
-            coeficientes.append({"Cliente": cli, "SKU": sku, **coefs})
-            for mes in meses_fcst:
-                resultados_bau.append({"Cliente": cli, "SKU": sku, "Mes": mes, "BAU_Unidades": round(promedio_hist)})
-            continue
+            bau_futuro = np.full(len(meses_fcst), promedio_hist)
+        else:
+            categoria = "Tendencia + estacionalidad"
+            mes_hist = np.array([mes_del_anio(m) for m in serie["Mes"]])
+            sin_h, cos_h = np.sin(2 * np.pi * mes_hist / 12), np.cos(2 * np.pi * mes_hist / 12)
+            X = np.column_stack([idx_hist, sin_h, cos_h] + [serie[c].values for c in macro_cols])
+            y_log = np.log1p(np.clip(y_hist, 0, None))
 
-        t = np.arange(n)
-        sin_t, cos_t = np.sin(2 * np.pi * t / 12), np.cos(2 * np.pi * t / 12)
+            modelo = LinearRegression().fit(X, y_log)
+            coefs = dict(zip(["trend", "sin", "cos"] + macro_cols, modelo.coef_))
+            coefs["intercept"] = modelo.intercept_
 
-        X_cols = [t, sin_t, cos_t] + [serie[c].values for c in macro_cols]
-        X = np.column_stack(X_cols)
-        y = y_hist
+            # Tope de sensatez sobre la tendencia: sin variables macro que expliquen el crecimiento,
+            # no dejamos que el modelo invente una tendencia agresiva a partir de puro ruido.
+            cap = CAP_TREND_CON_MACRO if macro_cols else CAP_TREND_SIN_MACRO
+            coefs["trend"] = float(np.clip(coefs["trend"], -cap, cap))
 
-        modelo = LinearRegression().fit(X, y)
-        coefs = dict(zip(["trend", "sin", "cos"] + macro_cols, modelo.coef_))
-        coefs["intercept"] = modelo.intercept_
+            X_f = np.column_stack([idx_futuro, sin_f, cos_f] +
+                                   [np.full(len(meses_fcst), referencias[c]) for c in macro_cols])
+            coef_vec = np.array([coefs["trend"], coefs["sin"], coefs["cos"]] + [coefs[c] for c in macro_cols])
+            y_log_pred = coefs["intercept"] + X_f @ coef_vec
+            bau_futuro = np.expm1(y_log_pred)
+
+            # Tope adicional de sensatez sobre el nivel: ninguna proyección supera 2x el máximo
+            # histórico de ESE combo, ni 3x su promedio.
+            tope = max(maximo_hist * 2, promedio_hist * 3, 1.0)
+            bau_futuro = np.clip(bau_futuro, 0, tope)
+
         coeficientes.append({"Cliente": cli, "SKU": sku, **coefs})
-
-        t_f = np.arange(n, n + len(meses_fcst))
-        sin_f, cos_f = np.sin(2 * np.pi * t_f / 12), np.cos(2 * np.pi * t_f / 12)
-        X_f_cols = [t_f, sin_f, cos_f] + [np.full(len(meses_fcst), referencias[c]) for c in macro_cols]
-        X_f = np.column_stack(X_f_cols)
-        bau = np.clip(modelo.predict(X_f), 0, tope)
-
         for k, mes in enumerate(meses_fcst):
-            resultados_bau.append({"Cliente": cli, "SKU": sku, "Mes": mes, "BAU_Unidades": round(bau[k])})
+            resultados_bau.append({"Cliente": cli, "SKU": sku, "Mes": mes,
+                                    "BAU_Unidades": round(bau_futuro[k]), "Categoria_Modelo": categoria})
+
+    return pd.DataFrame(resultados_bau), pd.DataFrame(coeficientes), referencias
 
     return pd.DataFrame(resultados_bau), pd.DataFrame(coeficientes), referencias
 
@@ -458,14 +492,26 @@ if modo_colaborativo:
     with c2:
         st.caption("Guarda el escenario macro, el % colaborativo, el precio base y el ajuste manual "
                    "en el Google Sheet compartido. La próxima persona que abra este link verá estos valores. "
-                   "Si dos personas guardan al mismo tiempo, gana la última en guardar.")
+                   "Si dos personas guardan al mismo tiempo, gana la última en guardar. Para eficiencia, "
+                   "solo se guardan las filas que sí editaste (no las miles que quedan en 0%).")
     if guardar:
         with st.spinner("Guardando..."):
             guardar_tabla_compartida(conn_sheets, "escenario_macro", escenario)
-            guardar_tabla_compartida(conn_sheets, "iniciativas_colaborativo", iniciativas)
+
+            iniciativas_editadas = iniciativas[
+                (iniciativas[PALANCAS_EJECUCION] != 0).any(axis=1) | (iniciativas["Iniciativa"].astype(str).str.strip() != "")
+            ]
+            guardar_tabla_compartida(conn_sheets, "iniciativas_colaborativo", iniciativas_editadas)
+
             guardar_tabla_compartida(conn_sheets, "precios_base", precios_base)
-            guardar_tabla_compartida(conn_sheets, "ajuste_manual_precio", ajuste_precio)
-        st.success(f"✅ Guardado {datetime.now():%Y-%m-%d %H:%M} — ya visible para todo el equipo.")
+
+            ajuste_precio_editado = ajuste_precio[
+                (ajuste_precio["Ajuste_Manual_Precio_%"] != 0) | (ajuste_precio["Motivo"].astype(str).str.strip() != "")
+            ]
+            guardar_tabla_compartida(conn_sheets, "ajuste_manual_precio", ajuste_precio_editado)
+        n_editadas = len(iniciativas_editadas) + len(ajuste_precio_editado)
+        st.success(f"✅ Guardado {datetime.now():%Y-%m-%d %H:%M} — {n_editadas} filas editadas guardadas, "
+                   f"ya visibles para todo el equipo.")
 
 # -------------------------------------------------------------------
 # 6. Cálculo del forecast final
@@ -499,18 +545,18 @@ final["n_mes"] = final["Mes"].map(mes_orden)
 final["Precio_Escalado"] = final["Precio_Base"] * (1 + tasa_inflacion_precio / 100.0) ** final["n_mes"]
 final["Precio"] = (final["Precio_Escalado"] * (1 + final["Ajuste_Manual_Precio_%"].fillna(0) / 100.0)).round(2)
 
-# Palanca "Mercado Orgánico" = Σ coef_i × (valor_escenario_i − valor_referencia_i)
-# (referencia = promedio de los últimos 6 meses reales, usado para entrenar el BAU)
-final["Mercado_Organico_Unidades"] = 0.0
+# Palanca "Mercado Orgánico" = Σ coef_i × (valor_escenario_i − valor_referencia_i), en % (el modelo
+# ahora corre en espacio log, así que los coeficientes de macro ya representan %-efecto, no unidades).
+final["Mercado_Organico_%"] = 0.0
 for c in macro_cols:
-    final["Mercado_Organico_Unidades"] += (final[c] - referencias[c]) * final[f"coef_{c}"]
+    final["Mercado_Organico_%"] += (final[c] - referencias[c]) * final[f"coef_{c}"]
 
 for pal in PALANCAS_EJECUCION:
     final[pal] = final[pal].fillna(0)
 final["Ejecucion_Propia_%"] = final[PALANCAS_EJECUCION].sum(axis=1)
 
 final["Unidades_Final"] = np.round(
-    (final["BAU_Unidades"] + final["Mercado_Organico_Unidades"]).clip(lower=0)
+    (final["BAU_Unidades"] * (1 + final["Mercado_Organico_%"])).clip(lower=0)
     * (1 + final["Ejecucion_Propia_%"] / 100.0)
 ).astype(int)
 final["Venta_Final"] = (final["Unidades_Final"] * final["Precio"]).round(0)
@@ -525,12 +571,20 @@ atributos_sku_id_presentes = [c for c in ATRIBUTOS_SKU_ID if c in hist.columns]
 cols_contexto = [c for c in ["SKU_ID"] + atributos_cliente_presentes + [x for x in ATRIBUTOS_SKU_BB if x in atributos_sku_presentes]
                  if c in final.columns]
 cols_mostrar = (["Cliente", "SKU"] + cols_contexto +
-                ["Mes", "BAU_Unidades", "Mercado_Organico_Unidades"] + PALANCAS_EJECUCION +
+                ["Mes", "Categoria_Modelo", "BAU_Unidades", "Mercado_Organico_%"] + PALANCAS_EJECUCION +
                 ["Unidades_Final", "Precio_Base", "Ajuste_Manual_Precio_%", "Precio", "Venta_Final"])
 st.dataframe(final[cols_mostrar], use_container_width=True)
-st.caption("Precio = Precio_Base escalado por la tasa de inflación mensual (6b) × (1 + Ajuste_Manual_Precio_% del mes). "
-           "Mercado_Organico_Unidades = palanca 'Mercado Orgánico' del puente de crecimiento (efecto de tus variables macro). "
-           "Pais, Canal, Grupo_Cliente, Marca, Categoria y SKU_ID son características de referencia — no entran al modelo de proyección.")
+st.caption("Categoria_Modelo indica cómo se proyectó cada Cliente-SKU: 'Excluido' (solo 1 mes de historia, no se "
+           "proyecta), 'Promedio plano' (poca historia o compras esporádicas, sin tendencia) o 'Tendencia + "
+           "estacionalidad' (6+ meses regulares). Precio = Precio_Base escalado por la tasa de inflación mensual "
+           "(6b) × (1 + Ajuste_Manual_Precio_% del mes). Mercado_Organico_% = palanca 'Mercado Orgánico' del "
+           "puente de crecimiento (efecto de tus variables macro, en %). Pais, Canal, Grupo_Cliente, Marca, "
+           "Categoria y SKU_ID son características de referencia — no entran al modelo de proyección.")
+
+with st.expander("¿Cuántos Cliente-SKU cayeron en cada categoría del modelo?"):
+    resumen_categoria = final.drop_duplicates(["Cliente", "SKU"])["Categoria_Modelo"].value_counts().reset_index()
+    resumen_categoria.columns = ["Categoría", "Cantidad de Cliente-SKU"]
+    st.dataframe(resumen_categoria, use_container_width=True)
 
 resumen = final.groupby("Cliente").agg(
     Unidades_BAU=("BAU_Unidades", "sum"),
@@ -647,7 +701,7 @@ st.caption("Misma estructura que la descomposición del presupuesto: parte de un
            "sumando cada palanca en orden, hasta llegar a la Venta Final proyectada.")
 
 venta_base = float((final["BAU_Unidades"] * final["Precio_Base"]).sum())
-unidades_tras_mercado = (final["BAU_Unidades"] + final["Mercado_Organico_Unidades"]).clip(lower=0)
+unidades_tras_mercado = (final["BAU_Unidades"] * (1 + final["Mercado_Organico_%"])).clip(lower=0)
 venta_tras_precio = float((final["BAU_Unidades"] * final["Precio"]).sum())
 venta_tras_mercado = float((unidades_tras_mercado * final["Precio"]).sum())
 
@@ -756,9 +810,23 @@ def exportar_excel(hist, coef_df, escenario, iniciativas, precios_base, ajuste_p
 
 excel_bytes = exportar_excel(hist, coef_df, escenario, iniciativas, precios_base, ajuste_precio,
                               tasa_inflacion_precio, final, resumen, puente_df)
-st.download_button(
-    "⬇️ Descargar Excel del modelo",
-    data=excel_bytes,
-    file_name=f"Forecast_Colaborativo_{datetime.now():%Y%m%d}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+csv_bytes = final[cols_mostrar].to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+
+col_dl1, col_dl2 = st.columns(2)
+with col_dl1:
+    st.download_button(
+        "⬇️ Descargar Excel del modelo (todas las hojas)",
+        data=excel_bytes,
+        file_name=f"Forecast_Colaborativo_{datetime.now():%Y%m%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+with col_dl2:
+    st.download_button(
+        "⬇️ Descargar Forecast Final en CSV",
+        data=csv_bytes,
+        file_name=f"Forecast_Final_{datetime.now():%Y%m%d}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+st.caption("El CSV usa ';' como separador y ',' como decimal — se abre directo en Excel en español sin pasos extra.")
