@@ -322,17 +322,22 @@ sku_attrs = hist[["SKU"] + atributos_sku_presentes].drop_duplicates("SKU") if at
 
 @st.cache_data(show_spinner=False)
 def ajustar_modelos(hist_df: pd.DataFrame, macro_cols: list, meses_fcst: list, combos: list):
-    resultados_bau, coeficientes, referencias = [], [], {}
-    MIN_MESES_TENDENCIA = 6      # con menos meses que esto, no se confía en tendencia
-    MIN_COBERTURA = 0.6          # si el cliente compra en menos del 60% de su propia ventana, es esporádico
+    """Enfoque top-down: se agregan TODOS los Cliente-SKU en una sola serie mensual total,
+    se ajusta un único modelo de tendencia + estacionalidad (+ macro) sobre esa serie agregada
+    —mucho más estable y con estacionalidad real y visible, al no diluirse en miles de series
+    individuales con poca historia— y luego se desagrega el resultado por la participación
+    histórica de cada Cliente-SKU dentro del total. Los de compra única (1 solo mes) quedan
+    excluidos (no se proyectan)."""
     CAP_TREND_CON_MACRO = 0.03   # tope de tendencia: 3%/mes si hay variables macro explicando el crecimiento
     CAP_TREND_SIN_MACRO = 0.01   # 1%/mes si NO hay macro — sin explicación, el BAU debe ser casi plano
+    CAP_ESTACIONALIDAD = 0.25    # con pocos años de historia (ej. 2), cada mes calendario tiene muy pocos
+                                  # datos (~2) para estimar su estacionalidad — se topa la amplitud para que
+                                  # no se sobreajuste a ruido y termine inventando un pico/valle irreal
 
-    for col in macro_cols:
-        referencias[col] = hist_df[col].tail(6).mean()
+    referencias = {col: hist_df[col].tail(6).mean() for col in macro_cols}
 
     # Índice calendario global (continuo, sin huecos) para que la tendencia y la estacionalidad
-    # se calculen sobre el mes real, no sobre la posición de la fila (que se rompe con huecos).
+    # se calculen sobre el mes real, no sobre la posición de la fila.
     todos_los_meses = sorted(set(hist_df["Mes"].unique()) | set(meses_fcst))
     base_y, base_m = (int(x) for x in todos_los_meses[0].split("-"))
 
@@ -343,69 +348,99 @@ def ajustar_modelos(hist_df: pd.DataFrame, macro_cols: list, meses_fcst: list, c
     def mes_del_anio(mes_str):
         return int(mes_str.split("-")[1])
 
+    # ---------------------------------------------------------------
+    # PASO 1: un único modelo sobre la serie TOTAL agregada (todos los Cliente-SKU sumados)
+    # ---------------------------------------------------------------
+    total_mensual = hist_df.groupby("Mes", as_index=False)["Unidades"].sum().sort_values("Mes")
+    y_hist_total = total_mensual["Unidades"].values.astype(float)
+    idx_hist_total = np.array([idx_calendario(m) for m in total_mensual["Mes"]])
+    mes_hist_total = np.array([mes_del_anio(m) for m in total_mensual["Mes"]])
+    sin_h, cos_h = np.sin(2 * np.pi * mes_hist_total / 12), np.cos(2 * np.pi * mes_hist_total / 12)
+
+    if macro_cols:
+        macro_por_mes = hist_df.groupby("Mes")[macro_cols].mean()
+        macro_hist_total = np.column_stack([macro_por_mes.reindex(total_mensual["Mes"])[c].values for c in macro_cols])
+    else:
+        macro_hist_total = np.empty((len(total_mensual), 0))
+
+    X_total = np.column_stack([idx_hist_total, sin_h, cos_h, macro_hist_total])
+    y_log_total = np.log1p(np.clip(y_hist_total, 0, None))
+    modelo_total = LinearRegression().fit(X_total, y_log_total)
+
+    coefs = dict(zip(["trend", "sin", "cos"] + macro_cols, modelo_total.coef_))
+    coefs["intercept"] = modelo_total.intercept_
+    cap = CAP_TREND_CON_MACRO if macro_cols else CAP_TREND_SIN_MACRO
+    coefs["trend"] = float(np.clip(coefs["trend"], -cap, cap))
+
+    amplitud_estacional = float(np.hypot(coefs["sin"], coefs["cos"]))
+    if amplitud_estacional > CAP_ESTACIONALIDAD:
+        factor_ajuste = CAP_ESTACIONALIDAD / amplitud_estacional
+        coefs["sin"] *= factor_ajuste
+        coefs["cos"] *= factor_ajuste
+
+    # Al topar tendencia/estacionalidad DESPUÉS de ajustar el modelo, el intercepto original queda
+    # descalibrado (fue estimado para acompañar los coeficientes sin topar). Se recalibra anclando
+    # al nivel RECIENTE (últimos 6 meses, no los 2 años completos) — así el BAU parte de "dónde está
+    # el negocio hoy", con una pendiente/estacionalidad conservadora encima, en vez de regresar hacia
+    # el promedio histórico completo si hubo crecimiento real en el camino.
+    coef_vec_hist = np.array([coefs["trend"], coefs["sin"], coefs["cos"]] + [coefs[c] for c in macro_cols])
+    componente_capado = X_total @ coef_vec_hist
+    residuales_recientes = (y_log_total - componente_capado)[-6:]
+    coefs["intercept"] = float(np.mean(residuales_recientes))
+
     idx_futuro = np.array([idx_calendario(m) for m in meses_fcst])
     mes_futuro = np.array([mes_del_anio(m) for m in meses_fcst])
     sin_f, cos_f = np.sin(2 * np.pi * mes_futuro / 12), np.cos(2 * np.pi * mes_futuro / 12)
+    macro_futuro = np.array([[referencias[c]] * len(meses_fcst) for c in macro_cols]).T if macro_cols else np.empty((len(meses_fcst), 0))
+    X_f_total = np.column_stack([idx_futuro, sin_f, cos_f, macro_futuro])
+    coef_vec = np.array([coefs["trend"], coefs["sin"], coefs["cos"]] + [coefs[c] for c in macro_cols])
+    y_log_pred_total = coefs["intercept"] + X_f_total @ coef_vec
+    bau_total_futuro = np.expm1(y_log_pred_total)
 
+    # Tope de sensatez sobre el nivel total: no más de 2x el máximo histórico ni 3x el promedio.
+    tope_total = max(y_hist_total.max() * 2, y_hist_total.mean() * 3, 1.0)
+    bau_total_futuro = np.clip(bau_total_futuro, 0, tope_total)
+    bau_total_dict = dict(zip(meses_fcst, bau_total_futuro))
+
+    # ---------------------------------------------------------------
+    # PASO 2: desagregar por participación histórica de cada Cliente-SKU dentro del total
+    # ---------------------------------------------------------------
+    conteo_meses = hist_df.groupby(["Cliente", "SKU"]).size()
+    vol_por_combo = hist_df.groupby(["Cliente", "SKU"])["Unidades"].sum()
+    vol_total_hist = hist_df["Unidades"].sum()
+
+    resultados_bau, coeficientes = [], []
     for cli, sku in combos:
-        serie = hist_df[(hist_df.Cliente == cli) & (hist_df.SKU == sku)].sort_values("Mes").reset_index(drop=True)
-        n = len(serie)
-        y_hist = serie["Unidades"].values.astype(float)
-        promedio_hist = y_hist.mean() if n else 0.0
-        maximo_hist = y_hist.max() if n else 0.0
-        idx_hist = np.array([idx_calendario(m) for m in serie["Mes"]])
-        cobertura = n / (idx_hist.max() - idx_hist.min() + 1) if n > 1 else 1.0
-
-        if n <= 1:
+        n = conteo_meses.get((cli, sku), 0)
+        vol = vol_por_combo.get((cli, sku), 0.0)
+        if n <= 1 or vol_total_hist <= 0:
+            participacion = 0.0
             categoria = "Excluido (compra única)"
-            coefs = {"trend": 0.0, "sin": 0.0, "cos": 0.0, **{c: 0.0 for c in macro_cols}, "intercept": 0.0}
-            bau_futuro = np.zeros(len(meses_fcst))
-        elif n < MIN_MESES_TENDENCIA or cobertura < MIN_COBERTURA:
-            categoria = "Promedio plano (poca historia / esporádico)"
-            coefs = {"trend": 0.0, "sin": 0.0, "cos": 0.0, **{c: 0.0 for c in macro_cols}, "intercept": promedio_hist}
-            bau_futuro = np.full(len(meses_fcst), promedio_hist)
         else:
-            categoria = "Tendencia + estacionalidad"
-            mes_hist = np.array([mes_del_anio(m) for m in serie["Mes"]])
-            sin_h, cos_h = np.sin(2 * np.pi * mes_hist / 12), np.cos(2 * np.pi * mes_hist / 12)
-            X = np.column_stack([idx_hist, sin_h, cos_h] + [serie[c].values for c in macro_cols])
-            y_log = np.log1p(np.clip(y_hist, 0, None))
+            participacion = vol / vol_total_hist
+            categoria = "Participación histórica (modelo top-down)"
 
-            modelo = LinearRegression().fit(X, y_log)
-            coefs = dict(zip(["trend", "sin", "cos"] + macro_cols, modelo.coef_))
-            coefs["intercept"] = modelo.intercept_
-
-            # Tope de sensatez sobre la tendencia: sin variables macro que expliquen el crecimiento,
-            # no dejamos que el modelo invente una tendencia agresiva a partir de puro ruido.
-            cap = CAP_TREND_CON_MACRO if macro_cols else CAP_TREND_SIN_MACRO
-            coefs["trend"] = float(np.clip(coefs["trend"], -cap, cap))
-
-            X_f = np.column_stack([idx_futuro, sin_f, cos_f] +
-                                   [np.full(len(meses_fcst), referencias[c]) for c in macro_cols])
-            coef_vec = np.array([coefs["trend"], coefs["sin"], coefs["cos"]] + [coefs[c] for c in macro_cols])
-            y_log_pred = coefs["intercept"] + X_f @ coef_vec
-            bau_futuro = np.expm1(y_log_pred)
-
-            # Tope adicional de sensatez sobre el nivel: ninguna proyección supera 2x el máximo
-            # histórico de ESE combo, ni 3x su promedio.
-            tope = max(maximo_hist * 2, promedio_hist * 3, 1.0)
-            bau_futuro = np.clip(bau_futuro, 0, tope)
-
-        coeficientes.append({"Cliente": cli, "SKU": sku, **coefs})
-        for k, mes in enumerate(meses_fcst):
+        coeficientes.append({"Cliente": cli, "SKU": sku, "Participacion_%": round(participacion * 100, 4), **coefs})
+        for mes in meses_fcst:
             resultados_bau.append({"Cliente": cli, "SKU": sku, "Mes": mes,
-                                    "BAU_Unidades": round(bau_futuro[k]), "Categoria_Modelo": categoria})
-
-    return pd.DataFrame(resultados_bau), pd.DataFrame(coeficientes), referencias
+                                    "BAU_Unidades": round(participacion * bau_total_dict[mes]),
+                                    "Categoria_Modelo": categoria})
 
     return pd.DataFrame(resultados_bau), pd.DataFrame(coeficientes), referencias
 
 
 bau_df, coef_df, referencias = ajustar_modelos(hist, macro_cols, meses_fcst, combos)
 
-st.subheader("Modelo ajustado (Regresión Lineal por Cliente-SKU)")
-st.dataframe(coef_df.round(4), use_container_width=True)
-st.caption("Cada fila es un modelo independiente: Unidades = intercepto + tendencia + estacionalidad + Σ(coef_macro × variable_macro)")
+st.subheader("Modelo ajustado (top-down: un único modelo sobre el total, desagregado por participación)")
+coefs_unicos = coef_df.drop(columns=["Cliente", "SKU", "Participacion_%"]).drop_duplicates().round(4)
+st.dataframe(coefs_unicos, use_container_width=True)
+st.caption("log(Unidades totales) = intercepto + tendencia·mes_calendario + sin/cos(mes_del_año) + "
+           "Σ(coef_macro × variable_macro). Un solo modelo para TODOS los Cliente-SKU juntos — más estable "
+           "que ajustar miles de modelos individuales con poca historia cada uno.")
+
+with st.expander("Ver participación histórica de cada Cliente-SKU (cómo se reparte el total)"):
+    st.dataframe(coef_df[["Cliente", "SKU", "Participacion_%"]].sort_values("Participacion_%", ascending=False),
+                 use_container_width=True)
 
 # -------------------------------------------------------------------
 # 3. Escenario macro editable
@@ -571,15 +606,18 @@ atributos_sku_id_presentes = [c for c in ATRIBUTOS_SKU_ID if c in hist.columns]
 cols_contexto = [c for c in ["SKU_ID"] + atributos_cliente_presentes + [x for x in ATRIBUTOS_SKU_BB if x in atributos_sku_presentes]
                  if c in final.columns]
 cols_mostrar = (["Cliente", "SKU"] + cols_contexto +
-                ["Mes", "Categoria_Modelo", "BAU_Unidades", "Mercado_Organico_%"] + PALANCAS_EJECUCION +
+                ["Mes", "Categoria_Modelo", "Participacion_%", "BAU_Unidades", "Mercado_Organico_%"] + PALANCAS_EJECUCION +
                 ["Unidades_Final", "Precio_Base", "Ajuste_Manual_Precio_%", "Precio", "Venta_Final"])
 st.dataframe(final[cols_mostrar], use_container_width=True)
-st.caption("Categoria_Modelo indica cómo se proyectó cada Cliente-SKU: 'Excluido' (solo 1 mes de historia, no se "
-           "proyecta), 'Promedio plano' (poca historia o compras esporádicas, sin tendencia) o 'Tendencia + "
-           "estacionalidad' (6+ meses regulares). Precio = Precio_Base escalado por la tasa de inflación mensual "
-           "(6b) × (1 + Ajuste_Manual_Precio_% del mes). Mercado_Organico_% = palanca 'Mercado Orgánico' del "
-           "puente de crecimiento (efecto de tus variables macro, en %). Pais, Canal, Grupo_Cliente, Marca, "
-           "Categoria y SKU_ID son características de referencia — no entran al modelo de proyección.")
+st.caption("El modelo es 'top-down': se ajusta tendencia + estacionalidad una sola vez sobre el TOTAL de todos "
+           "los Cliente-SKU juntos (mucho más estable que miles de series individuales con poca historia), y "
+           "ese total se reparte según la Participacion_% histórica de cada Cliente-SKU. Categoria_Modelo indica "
+           "si esa combinación se 'Excluyó' (solo 1 mes de historia, no se proyecta) o si tiene 'Participación "
+           "histórica' (sí se proyecta, según su peso dentro del total). Precio = Precio_Base escalado por la "
+           "tasa de inflación mensual (6b) × (1 + Ajuste_Manual_Precio_% del mes). Mercado_Organico_% = palanca "
+           "'Mercado Orgánico' del puente de crecimiento (efecto de tus variables macro, en %, aplicado sobre el "
+           "total). Pais, Canal, Grupo_Cliente, Marca, Categoria y SKU_ID son características de referencia — no "
+           "entran al modelo de proyección.")
 
 with st.expander("¿Cuántos Cliente-SKU cayeron en cada categoría del modelo?"):
     resumen_categoria = final.drop_duplicates(["Cliente", "SKU"])["Categoria_Modelo"].value_counts().reset_index()

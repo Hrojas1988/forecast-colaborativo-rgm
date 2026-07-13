@@ -71,29 +71,35 @@ datos compartida. Sin esa configuración, la app funciona igual, solo sin guarda
 
 Botón de descarga al final exporta todo a Excel (una hoja por tabla).
 
-## Qué hace el modelo
-Por cada combinación Cliente-SKU, primero se clasifica según la calidad de su historia:
-- **Excluido (compra única):** solo 1 mes de historia — no se proyecta (BAU = 0).
-- **Promedio plano (poca historia / esporádico):** menos de 6 meses, o compras con huecos grandes entre
-  mes y mes — se proyecta el promedio histórico, sin tendencia ni estacionalidad.
-- **Tendencia + estacionalidad:** 6+ meses con compras razonablemente regulares — se ajusta una Regresión
-  Lineal **en espacio logarítmico** (el modelo aprende un % de crecimiento mensual, no unidades absolutas):
+## Qué hace el modelo (enfoque top-down)
+En vez de ajustar un modelo independiente por cada Cliente-SKU (miles, la mayoría con poca historia y
+mucho ruido), el modelo:
 
-  `log(Unidades) = intercepto + coef_trend·mes_calendario + coef_sin·sin(mes_del_año) + coef_cos·cos(mes_del_año) + Σ coef_macro_i · variable_macro_i`
+1. **Agrega todos los Cliente-SKU en una sola serie mensual total** y ajusta un único modelo de tendencia +
+   estacionalidad (+ variables macro) sobre esa serie — mucho más estable, y con estacionalidad real y
+   visible (no diluida entre miles de series individuales con poca o ninguna historia).
 
-  La tendencia tiene un tope de sensatez: máximo 3%/mes si seleccionaste variables macro, o solo 1%/mes si
-  no seleccionaste ninguna (sin variables que expliquen el crecimiento, el modelo no debe inventarlo). La
-  estacionalidad se calcula sobre el mes calendario real (enero, febrero...), no sobre la posición de la
-  fila, así que los huecos en el histórico no la desalinean.
+   `log(Unidades totales) = intercepto + coef_trend·mes_calendario + coef_sin·sin(mes_del_año) + coef_cos·cos(mes_del_año) + Σ coef_macro_i · variable_macro_i`
 
-El BAU se proyecta usando el valor de referencia (promedio de los últimos 6 meses) de cada variable macro.
-El impacto de tu escenario editado se calcula como `coef_i × (valor_escenario − valor_referencia)`, ahora en
-**%** (Mercado_Organico_%), evitando doble conteo. El % colaborativo (palancas de ejecución propia) se aplica
-multiplicativamente sobre las unidades (BAU ya ajustado por Mercado Orgánico).
-El precio final = Precio_Base × (1 + tasa_inflación)^n_mes × (1 + Ajuste_Manual_Precio_% del mes).
+2. **Desagrega** ese total proyectado según la **participación histórica** de cada Cliente-SKU dentro del
+   total (su volumen histórico ÷ el volumen histórico de todos). Los clientes de **compra única** (1 solo
+   mes de historia) quedan **excluidos** — no se proyectan.
 
-En el Forecast Final (sección 7) puedes ver la columna `Categoria_Modelo` para saber cómo se proyectó cada
-fila, y un expander con el conteo de Cliente-SKU en cada categoría.
+**3 topes de sensatez** para que el modelo no invente crecimiento o estacionalidad a partir de ruido:
+- Tendencia: máximo 3%/mes si seleccionaste variables macro, o solo 1%/mes si no seleccionaste ninguna.
+- Estacionalidad: la amplitud del ciclo anual se topa (con solo 2-3 años de historia, cada mes calendario
+  tiene muy pocos datos para estimarse solo, y puede sobreajustarse a un pico/valle irreal).
+- Nivel: el intercepto se recalibra siempre al promedio de los **últimos 6 meses** (no a los 2 años
+  completos), para que el punto de partida sea "dónde está el negocio hoy", no un promedio histórico diluido.
+
+El impacto de tu escenario macro editado se calcula como `coef_i × (valor_escenario − valor_referencia)`, en
+**%** (Mercado_Organico_%), aplicado sobre el total ya desagregado. El % de las palancas de ejecución propia
+se aplica multiplicativamente encima. El precio final = Precio_Base × (1 + tasa_inflación)^n_mes × (1 +
+Ajuste_Manual_Precio_% del mes).
+
+En el Forecast Final (sección 7) puedes ver `Categoria_Modelo` ("Excluido" o "Participación histórica") y
+`Participacion_%` de cada Cliente-SKU, más un expander con el conteo de cada categoría y otro con el detalle
+de participación completo.
 
 ## Descargas
 Al final hay 2 botones: **Excel** (todas las hojas: histórico, coeficientes, escenario, palancas, precios,
