@@ -489,11 +489,24 @@ st.subheader("6. Precio proyectado (híbrido: automático + ajuste manual)")
 col_a, col_b = st.columns([1, 1])
 with col_a:
     st.markdown("**6a. Precio base por SKU (editable)**")
-    precio_default = hist.groupby("SKU")["Precio"].last().reset_index().rename(columns={"Precio": "Precio_Base"})
+
+    def _precio_ponderado_reciente(g):
+        g = g.sort_values("Mes").tail(6)
+        u = g["Unidades"].sum()
+        return (g["Unidades"] * g["Precio"]).sum() / u if u != 0 else g["Precio"].tail(6).median()
+
+    precio_default = (
+        hist.groupby("SKU")[["Mes", "Unidades", "Precio"]]
+        .apply(_precio_ponderado_reciente, include_groups=False)
+        .reset_index().rename(columns={0: "Precio_Base"})
+    )
     if modo_colaborativo:
         precio_default = leer_tabla_compartida(conn_sheets, "precios_base", precio_default,
                                                 claves=["SKU"], nombre_legible="Precio base")
     precios_base = st.data_editor(precio_default, num_rows="fixed", use_container_width=True, key="precios_base")
+    st.caption("Se usa el precio ponderado por volumen real (Venta ÷ Unidades) de los últimos 6 meses por SKU "
+               "— no el último dato puntual — para que una transacción atípica o un renglón que no es un "
+               "precio unitario real (ej. un monto de descuento o servicio) no distorsione todo el año proyectado.")
 
 with col_b:
     st.markdown("**6b. Tasa de inflación mensual para escalar el precio**")
