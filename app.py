@@ -33,6 +33,14 @@ if not os.path.exists(PLACEHOLDER_IMG):
     img = Image.new("RGB", (200, 200), color=(230, 230, 230))
     img.save(PLACEHOLDER_IMG)
 
+# Versión en base64 del placeholder: la grilla de precios se dibuja como HTML
+# crudo, y un <img src="..."> ahí NO puede apuntar a un archivo del servidor
+# (el navegador de quien ve la app no tiene acceso a ese disco). Por eso el
+# placeholder se embebe directo en el HTML como data URI.
+import base64 as _base64
+with open(PLACEHOLDER_IMG, "rb") as _f:
+    PLACEHOLDER_IMG_DATA_URI = "data:image/png;base64," + _base64.b64encode(_f.read()).decode("ascii")
+
 COLUMNS = [
     "sku", "nombre", "tipo", "empresa", "categoria", "canal",
     "presentacion", "unidad_medida", "imagen_url",
@@ -421,10 +429,10 @@ _DRIVE_ID_PATTERNS = [
 
 def resolve_image(url: str) -> str:
     if not isinstance(url, str) or not url.strip():
-        return PLACEHOLDER_IMG
+        return PLACEHOLDER_IMG_DATA_URI
     u = url.strip()
     if not u.lower().startswith(("http://", "https://")):
-        return PLACEHOLDER_IMG
+        return PLACEHOLDER_IMG_DATA_URI
 
     # Cualquier link de Google Drive (visor, compartir, o ya convertido) se
     # normaliza al formato de miniatura, que es el que Google permite
