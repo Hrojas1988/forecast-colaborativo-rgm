@@ -1141,9 +1141,10 @@ with tab_mant:
         "para todo el equipo de inmediato."
     )
     st.caption(
-        "Columna **imagen_url**: pega el enlace directo a la foto del producto "
-        "(por ejemplo, un link de Google Drive compartido como 'cualquiera con el enlace' "
-        "convertido a formato de imagen, o un link de SharePoint/intranet público)."
+        "Columna **imagen_url**: pega el link de la foto del producto. Si es de Google Drive, "
+        "puedes pegar el link tal cual te lo da el botón 'Compartir' (con que esté como "
+        "'Cualquiera con el enlace', la app lo convierte sola al formato correcto). "
+        "También funciona un link directo de SharePoint/intranet público."
     )
 
     edited = st.data_editor(
